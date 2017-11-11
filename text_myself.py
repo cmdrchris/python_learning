@@ -7,8 +7,6 @@ Module in Chapter 16).
 
 Possible areas for future development:
 
-    - Use "backoff" to more elegantly handle delayed collection of SMS message
-        send status after posting initial send request.
     - Support SMS messages with media (e.g. images).
     - Allow usage beyond restrictions of Twilio free account
         (e.g. send to/from multiple phone numbers).
@@ -19,9 +17,9 @@ import argparse
 from configparser import ConfigParser
 import logging
 import os
-import time
 
 # 3rd party
+import backoff
 from twilio.rest import Client
 
 # logging
@@ -57,14 +55,15 @@ def get_sms_credentials(config_filepath=None):
         credentials['ACCOUNT_SID'] = config['Twilio']['ACCOUNT_SID']
         credentials['AUTH_TOKEN'] = config['Twilio']['AUTH_TOKEN']
         credentials['FROM_PHONE_NUMBER'] = config['Twilio']['FROM_PHONE_NUMBER']
-        credentials['TO_PHONE_NUMBER'] = config['General']['TO_PHONE_NUMBER']
+        credentials['TO_PHONE_NUMBER'] = config['General']['MY_PHONE_NUMBER']
     except Exception as e:
         print(config_filepath)
         print('An exception occurred when reading config file: %s' % e)
 
     return credentials
 
-def send_sms_message(message=None, credentials=None):
+def send_sms_message(client=None, from_phone_number=None, to_phone_number=None,
+                     message=None):
     '''
     Sends a simple, text-only SMS message using the Twilio REST client.
 
@@ -75,36 +74,48 @@ def send_sms_message(message=None, credentials=None):
             are associated with an active Twilio user.
 
     Returns:
-        sms_message_status: The function allows 10 seconds to pass after sending
-            a message then polls the API to fetch updated send status.
+        sms_message: Twilio SMS messsage object. This can be used to track
+            delivery status of the message.
     '''
+    if not client:
+        raise ValueError('No API client found.')
+    if not from_phone_number:
+        raise ValueError('No from-phone-number found.')
+    if not to_phone_number:
+        raise ValueError('No to-phone-number found.')
     if not message:
         raise ValueError('No message found.')
 
-    if not credentials:
-        raise ValueError('No API credentials found.')
-
-    client = Client(credentials['ACCOUNT_SID'], credentials['AUTH_TOKEN'])
-    sms_status = None
-
+    sms_message = None
     try:
         sms_message = client.messages.create(
-            to=credentials['TO_PHONE_NUMBER'],
+            to=to_phone_number,
             body=message,
-            from_=credentials['FROM_PHONE_NUMBER']
-        )
-        # pause for 10 seconds then collect send status
-        time.sleep(10)
-        sms_message_updated = client.messages.get(sms_message.sid).fetch()
-        sms_status = sms_message_updated.status
-
+            from_=from_phone_number)
     except Exception as e:
-        sms_status = 'send_error'
-        print('There was a problem when sending SMS message: %s' % e)
+        LOGGER.warning('There was a problem when sending SMS message: %s', e)
 
-    return sms_status
+    return sms_message
 
-def send(message=None):
+@backoff.on_predicate(backoff.fibo, lambda status: status != 'delivered', max_value=13)
+def confirm_sms_delivery(client, sms_message=None):
+    '''
+    Fetches current SMS message status value from the Twilio REST API
+
+    Args:
+        - sms_message: Twilio SMS object.
+
+    Returns:
+        - status: String that confirms final delivery of the SMS message.
+    '''
+    status = None
+    if sms_message is not None:
+        sms_message_updated = client.messages.get(sms_message.sid).fetch()
+        status = sms_message_updated.status
+
+    return status
+
+def run(message=None):
     '''
     Run method for module.
 
@@ -123,19 +134,23 @@ have sent. Up to 1.6k characters is supported.')
 
     try:
         credentials = get_sms_credentials()
-        message_status = send_sms_message(message=message, credentials=credentials)
-        message_short_ver = message[:30] + '...'
+        client = Client(credentials['ACCOUNT_SID'], credentials['AUTH_TOKEN'])
+        from_phone_number = credentials['FROM_PHONE_NUMBER']
+        to_phone_number = credentials['TO_PHONE_NUMBER']
+        sms_message = send_sms_message(client, from_phone_number, to_phone_number, message)
+        status = confirm_sms_delivery(client, sms_message)
 
-        if message_status == 'delivered':
-            LOGGER.info('text_myself.py: Successfully sent message: "%s"',
+        message_short_ver = message[:30] + '...'
+        if status == 'delivered':
+            LOGGER.info('Successfully sent message: "%s"',
                         message_short_ver)
         else:
             LOGGER.warning('Issue sending message: "%s". Message status: %s',
-                           message_short_ver, message_status)
+                           message_short_ver, status)
     except Exception as e:
         print('Error sending message: %s' % e)
         LOGGER.warning('Error sending message: %s', e)
 
 
 if __name__ == '__main__':
-    send()
+    run()
